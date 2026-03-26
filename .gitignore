@@ -1,0 +1,5 @@
+# Root-level ignores for the kube repo
+output/
+terraform.tfstate
+*.tfstate
+*.tfstate.backup

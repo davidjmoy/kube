@@ -61,7 +61,7 @@ for ($i = 0; $i -lt 24; $i++) {
         }
     }
     catch {}
-    Write-Host "  Waiting... ($($i * 10)s)" -ForegroundColor Gray
+    Write-Host "  Waiting... ($($i * 10) sec)" -ForegroundColor Gray
     Start-Sleep -Seconds 10
 }
 

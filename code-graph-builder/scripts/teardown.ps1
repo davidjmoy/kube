@@ -15,11 +15,9 @@ $ErrorActionPreference = "Stop"
 Write-Host "=== Code Graph Chatbot — Teardown ===" -ForegroundColor Red
 Write-Host ""
 Write-Host "This will DESTROY all Azure resources:" -ForegroundColor Yellow
-Write-Host "  - AKS cluster (damoy-aks)" -ForegroundColor Yellow
+Write-Host "  - Container Instance (codegraph-chatbot)" -ForegroundColor Yellow
 Write-Host "  - Container Registry (damoyacr)" -ForegroundColor Yellow
 Write-Host "  - Azure OpenAI (damoy-openai3)" -ForegroundColor Yellow
-Write-Host "  - Public IP (codegraph-ip)" -ForegroundColor Yellow
-Write-Host "  - Managed Identity (code-graph-identity)" -ForegroundColor Yellow
 Write-Host "  - Resource Group (kube)" -ForegroundColor Yellow
 Write-Host ""
 
@@ -42,4 +40,4 @@ Write-Host "=== All resources destroyed ===" -ForegroundColor Green
 Write-Host ""
 Write-Host "To rebuild later:" -ForegroundColor Cyan
 Write-Host "  cd terraform; terraform apply" -ForegroundColor White
-Write-Host "  cd ..; .\scripts\rebuild.ps1" -ForegroundColor White
+Write-Host "  cd ..; .\scripts\deploy.ps1" -ForegroundColor White

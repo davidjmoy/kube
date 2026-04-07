@@ -1,202 +1,268 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
+import ChatMessage from './components/ChatMessage';
+import { useConversation } from './hooks/useConversation';
+import { useChat } from './hooks/useChat';
 import './ChatBot.css';
 
-const ChatBot = () => {
-    const [messages, setMessages] = useState([
-        {
-            id: 0,
-            role: 'assistant',
-            content: 'Hi! I\'m the Kubernetes Code Assistant. I can help you understand the Kubernetes codebase. Ask me about functions, classes, or architecture!',
-            references: []
-        }
-    ]);
-    const [inputValue, setInputValue] = useState('');
-    const [isLoading, setIsLoading] = useState(false);
-    const [error, setError] = useState(null);
-    const messagesEndRef = useRef(null);
+const API_BASE = process.env.REACT_APP_API_URL || '';
 
-    const scrollToBottom = () => {
-        messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+function getTrailingToken(text, cursor) {
+    const head = text.slice(0, cursor);
+    const match = head.match(/([A-Za-z_][A-Za-z0-9_.]*)$/);
+    if (!match) {
+        return null;
+    }
+
+    const token = match[1];
+    return {
+        token,
+        start: cursor - token.length,
+        end: cursor,
+    };
+}
+
+const ChatBot = ({ clearHistoryRef, exportHistoryRef }) => {
+    const { messages, addMessage, updateLastMessage, clearHistory, exportHistory } = useConversation();
+    const { sendMessage, isStreaming, cancel } = useChat({ messages, addMessage, updateLastMessage });
+    const [inputValue, setInputValue] = useState('');
+    const [suggestions, setSuggestions] = useState([]);
+    const [showSuggestions, setShowSuggestions] = useState(false);
+    const [activeSuggestionIndex, setActiveSuggestionIndex] = useState(-1);
+    const [suggestionRange, setSuggestionRange] = useState(null);
+    const messagesEndRef = useRef(null);
+    const messagesContainerRef = useRef(null);
+    const userAtBottomRef = useRef(true);
+    const textareaRef = useRef(null);
+    const autocompleteAbortRef = useRef(null);
+
+    // Track whether user is scrolled to bottom
+    const handleScroll = useCallback(() => {
+        const el = messagesContainerRef.current;
+        if (!el) return;
+        const threshold = 80;
+        userAtBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < threshold;
+    }, []);
+
+    // Only auto-scroll if user is near the bottom
+    useEffect(() => {
+        if (userAtBottomRef.current) {
+            messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+        }
+    }, [messages]);
+
+    // Expose clear/export to parent via refs
+    useEffect(() => {
+        if (clearHistoryRef) clearHistoryRef.current = clearHistory;
+        if (exportHistoryRef) exportHistoryRef.current = exportHistory;
+    }, [clearHistory, exportHistory, clearHistoryRef, exportHistoryRef]);
+
+    // Escape key cancels streaming
+    useEffect(() => {
+        const handleKeyDown = (e) => {
+            if (e.key === 'Escape' && isStreaming) {
+                cancel();
+            }
+        };
+        document.addEventListener('keydown', handleKeyDown);
+        return () => document.removeEventListener('keydown', handleKeyDown);
+    }, [isStreaming, cancel]);
+
+    const doSend = useCallback(() => {
+        if (!inputValue.trim() || isStreaming) return;
+        sendMessage(inputValue);
+        setInputValue('');
+        // Reset textarea height
+        if (textareaRef.current) textareaRef.current.style.height = 'auto';
+    }, [inputValue, isStreaming, sendMessage]);
+
+    const handleSubmit = (e) => {
+        e.preventDefault();
+        doSend();
     };
 
     useEffect(() => {
-        scrollToBottom();
-    }, [messages]);
+        if (isStreaming) {
+            setShowSuggestions(false);
+            setSuggestions([]);
+            setActiveSuggestionIndex(-1);
+            return;
+        }
 
-    const handleSendMessage = async (e) => {
-        e.preventDefault();
-        if (!inputValue.trim()) return;
+        const textarea = textareaRef.current;
+        if (!textarea) return;
 
-        // Add user message
-        const userMessage = {
-            id: messages.length,
-            role: 'user',
-            content: inputValue,
-            references: []
-        };
-        setMessages(prev => [...prev, userMessage]);
-        setInputValue('');
-        setIsLoading(true);
-        setError(null);
+        const cursor = textarea.selectionStart ?? inputValue.length;
+        const range = getTrailingToken(inputValue, cursor);
+        if (!range || range.token.length < 2) {
+            setShowSuggestions(false);
+            setSuggestions([]);
+            setActiveSuggestionIndex(-1);
+            setSuggestionRange(null);
+            return;
+        }
 
-        try {
-            // Build conversation history
-            const conversationHistory = messages
-                .filter(m => m.role !== 'system')
-                .map(m => ({
-                    role: m.role,
-                    content: m.content
-                }));
+        setSuggestionRange(range);
 
-            // Stream the response
-            const response = await fetch('/chat/stream', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                },
-                body: JSON.stringify({
-                    message: inputValue,
-                    conversation_history: conversationHistory,
-                    include_graph_context: true
-                })
-            });
+        const timeout = setTimeout(async () => {
+            autocompleteAbortRef.current?.abort();
+            const controller = new AbortController();
+            autocompleteAbortRef.current = controller;
 
-            if (!response.ok) {
-                throw new Error(`HTTP error! status: ${response.status}`);
-            }
+            try {
+                const response = await fetch(
+                    `${API_BASE}/graph/suggest?q=${encodeURIComponent(range.token)}&limit=8`,
+                    { signal: controller.signal }
+                );
+                if (!response.ok) {
+                    return;
+                }
 
-            // Create assistant message that will accumulate tokens
-            const assistantMessage = {
-                id: messages.length + 1,
-                role: 'assistant',
-                content: '',
-                references: [],
-                isStreaming: true
-            };
-
-            setMessages(prev => [...prev, assistantMessage]);
-
-            // Process the stream
-            const reader = response.body.getReader();
-            const decoder = new TextDecoder();
-            let buffer = '';
-
-            while (true) {
-                const { done, value } = await reader.read();
-                if (done) break;
-
-                buffer += decoder.decode(value, { stream: true });
-                const lines = buffer.split('\n');
-                buffer = lines[lines.length - 1];
-
-                for (let i = 0; i < lines.length - 1; i++) {
-                    const line = lines[i];
-                    if (line.startsWith('data: ')) {
-                        try {
-                            const data = JSON.parse(line.slice(6));
-
-                            if (data.token) {
-                                // Accumulate token
-                                setMessages(prev => {
-                                    const updated = [...prev];
-                                    updated[updated.length - 1].content += data.token;
-                                    return updated;
-                                });
-                            }
-
-                            if (data.type === 'references' && data.references) {
-                                setMessages(prev => {
-                                    const updated = [...prev];
-                                    updated[updated.length - 1].references = data.references;
-                                    return updated;
-                                });
-                            }
-
-                            if (data.type === 'complete') {
-                                setMessages(prev => {
-                                    const updated = [...prev];
-                                    updated[updated.length - 1].isStreaming = false;
-                                    return updated;
-                                });
-                            }
-
-                            if (data.type === 'error') {
-                                setError(data.message);
-                                setMessages(prev => {
-                                    const updated = [...prev];
-                                    updated[updated.length - 1].isStreaming = false;
-                                    return updated;
-                                });
-                            }
-                        } catch (e) {
-                            console.error('Failed to parse SSE data:', e);
-                        }
-                    }
+                const data = await response.json();
+                const next = Array.isArray(data.results) ? data.results : [];
+                setSuggestions(next);
+                setShowSuggestions(next.length > 0);
+                setActiveSuggestionIndex(next.length > 0 ? 0 : -1);
+            } catch (err) {
+                if (err.name !== 'AbortError') {
+                    setShowSuggestions(false);
                 }
             }
-        } catch (err) {
-            setError(err.message);
-            console.error('Error:', err);
-        } finally {
-            setIsLoading(false);
+        }, 180);
+
+        return () => clearTimeout(timeout);
+    }, [inputValue, isStreaming]);
+
+    const applySuggestion = useCallback((suggestion) => {
+        if (!suggestion || !textareaRef.current || !suggestionRange) return;
+
+        const before = inputValue.slice(0, suggestionRange.start);
+        const after = inputValue.slice(suggestionRange.end);
+        const nextValue = `${before}${suggestion.insert_text}${after}`;
+        const nextCursor = before.length + suggestion.insert_text.length;
+
+        setInputValue(nextValue);
+        setShowSuggestions(false);
+        setSuggestions([]);
+        setActiveSuggestionIndex(-1);
+
+        requestAnimationFrame(() => {
+            const textarea = textareaRef.current;
+            if (!textarea) return;
+            textarea.focus();
+            textarea.selectionStart = nextCursor;
+            textarea.selectionEnd = nextCursor;
+            textarea.style.height = 'auto';
+            textarea.style.height = Math.min(textarea.scrollHeight, 150) + 'px';
+        });
+    }, [inputValue, suggestionRange]);
+
+    const handleKeyDown = (e) => {
+        if (showSuggestions && suggestions.length > 0) {
+            if (e.key === 'ArrowDown') {
+                e.preventDefault();
+                setActiveSuggestionIndex((idx) => (idx + 1) % suggestions.length);
+                return;
+            }
+            if (e.key === 'ArrowUp') {
+                e.preventDefault();
+                setActiveSuggestionIndex((idx) => (idx <= 0 ? suggestions.length - 1 : idx - 1));
+                return;
+            }
+            if ((e.key === 'Enter' || e.key === 'Tab') && activeSuggestionIndex >= 0) {
+                e.preventDefault();
+                applySuggestion(suggestions[activeSuggestionIndex]);
+                return;
+            }
+            if (e.key === 'Escape') {
+                e.preventDefault();
+                setShowSuggestions(false);
+                return;
+            }
+        }
+
+        // Enter sends, Shift+Enter adds newline
+        if (e.key === 'Enter' && !e.shiftKey) {
+            e.preventDefault();
+            doSend();
         }
     };
 
+    const handleTextareaChange = (e) => {
+        setInputValue(e.target.value);
+        // Auto-resize textarea
+        e.target.style.height = 'auto';
+        e.target.style.height = Math.min(e.target.scrollHeight, 150) + 'px';
+    };
+
+    const handleRetry = useCallback(() => {
+        // Remove the errored assistant message, then resend
+        const lastUserMsg = [...messages].reverse().find(m => m.role === 'user');
+        if (lastUserMsg) {
+            // Remove last two messages (user + errored assistant) and re-send
+            updateLastMessage(() => null); // will be replaced by sendMessage
+            sendMessage(lastUserMsg.content);
+        }
+    }, [messages, sendMessage, updateLastMessage]);
+
     return (
-        <div className="chatbot-container">
-            <div className="chatbot-header">
-                <h1>Kubernetes Code Assistant</h1>
-                <p>Ask questions about the Kubernetes codebase</p>
-            </div>
-
-            <div className="messages-container">
-                {messages.map((msg) => (
-                    <div key={msg.id} className={`message ${msg.role}`}>
-                        <div className="message-content">
-                            <div className="message-text">{msg.content}</div>
-                            {msg.isStreaming && <span className="streaming-cursor">▌</span>}
-                        </div>
-
-                        {msg.references && msg.references.length > 0 && (
-                            <div className="references">
-                                <div className="references-title">Code References:</div>
-                                {msg.references.map((ref, idx) => (
-                                    <div key={idx} className="reference-item">
-                                        <div className="reference-name">{ref.function_name}</div>
-                                        <div className="reference-location">
-                                            {ref.file}:{ref.line}
-                                        </div>
-                                        <div className="reference-package">{ref.package}</div>
-                                    </div>
-                                ))}
-                            </div>
-                        )}
-                    </div>
+        <>
+            <div className="messages" ref={messagesContainerRef} onScroll={handleScroll}>
+                {messages.map((msg, idx) => (
+                    msg && <ChatMessage
+                        key={msg.id}
+                        message={msg}
+                        onRetry={msg.error && idx === messages.length - 1 ? handleRetry : null}
+                    />
                 ))}
-                {error && (
-                    <div className="message error">
-                        <div className="message-content">
-                            <span className="error-icon">⚠️</span> {error}
-                        </div>
-                    </div>
-                )}
                 <div ref={messagesEndRef} />
             </div>
-
-            <form className="input-form" onSubmit={handleSendMessage}>
-                <input
-                    type="text"
-                    value={inputValue}
-                    onChange={(e) => setInputValue(e.target.value)}
-                    placeholder="Ask about Kubernetes code..."
-                    disabled={isLoading}
-                    className="message-input"
-                />
-                <button type="submit" disabled={isLoading} className="send-button">
-                    {isLoading ? '...' : 'Send'}
-                </button>
+            <form className="input-area" onSubmit={handleSubmit}>
+                <div className="input-with-suggestions">
+                    <textarea
+                        ref={textareaRef}
+                        value={inputValue}
+                        onChange={handleTextareaChange}
+                        onKeyDown={handleKeyDown}
+                        onBlur={() => setTimeout(() => setShowSuggestions(false), 120)}
+                        onFocus={() => {
+                            if (suggestions.length > 0) setShowSuggestions(true);
+                        }}
+                        placeholder="Ask about Kubernetes code or docs... (Shift+Enter for newline)"
+                        autoComplete="off"
+                        autoFocus
+                        rows={1}
+                    />
+                    {showSuggestions && suggestions.length > 0 && (
+                        <div className="autocomplete-menu">
+                            {suggestions.map((suggestion, idx) => (
+                                <button
+                                    key={`${suggestion.kind}-${suggestion.name}-${suggestion.package}-${idx}`}
+                                    type="button"
+                                    className={`autocomplete-item ${idx === activeSuggestionIndex ? 'active' : ''}`}
+                                    onMouseDown={(e) => {
+                                        e.preventDefault();
+                                        applySuggestion(suggestion);
+                                    }}
+                                >
+                                    <span className={`autocomplete-kind ${suggestion.kind}`}>{suggestion.kind}</span>
+                                    <span className="autocomplete-name">{suggestion.name}</span>
+                                    <span className="autocomplete-package">{suggestion.package}</span>
+                                </button>
+                            ))}
+                        </div>
+                    )}
+                </div>
+                {isStreaming ? (
+                    <button type="button" onClick={cancel} className="cancel-btn">
+                        Stop
+                    </button>
+                ) : (
+                    <button type="submit" disabled={!inputValue.trim()}>
+                        Send
+                    </button>
+                )}
             </form>
-        </div>
+        </>
     );
 };
 

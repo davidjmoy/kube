@@ -1,0 +1,172 @@
+.msg {
+    max-width: 85%;
+    padding: 12px 16px;
+    border-radius: 12px;
+    line-height: 1.6;
+    font-size: 14px;
+    word-wrap: break-word;
+    animation: slideIn 0.3s ease-out;
+}
+
+.msg.user {
+    align-self: flex-end;
+    background: #1e3a5f;
+    color: #c8dfff;
+    border-bottom-right-radius: 4px;
+    white-space: pre-wrap;
+}
+
+.msg.assistant {
+    align-self: flex-start;
+    background: #1a1a2e;
+    color: #d0d0d0;
+    border-bottom-left-radius: 4px;
+    border: 1px solid #2a2a4a;
+}
+
+.msg-content {
+    overflow-wrap: break-word;
+}
+
+.msg-text {
+    white-space: pre-wrap;
+}
+
+/* Markdown styles */
+.msg.assistant .markdown-body a {
+    color: #7eb8ff;
+    text-decoration: none;
+}
+
+.msg.assistant .markdown-body a:hover {
+    text-decoration: underline;
+}
+
+.msg.assistant .markdown-body .inline-code {
+    background: #1e1e3e;
+    padding: 1px 5px;
+    border-radius: 3px;
+    font-size: 13px;
+    color: #a8d8ff;
+}
+
+.msg.assistant .markdown-body h2,
+.msg.assistant .markdown-body h3 {
+    color: #7eb8ff;
+    margin: 12px 0 6px 0;
+}
+
+.msg.assistant .markdown-body h2 {
+    font-size: 16px;
+}
+
+.msg.assistant .markdown-body h3 {
+    font-size: 14px;
+}
+
+.msg.assistant .markdown-body ul,
+.msg.assistant .markdown-body ol {
+    margin: 6px 0 6px 20px;
+}
+
+.msg.assistant .markdown-body li {
+    margin-bottom: 3px;
+}
+
+.msg.assistant .markdown-body p {
+    margin: 6px 0;
+}
+
+.msg.assistant .markdown-body blockquote {
+    border-left: 3px solid #3a3a5a;
+    padding-left: 12px;
+    color: #999;
+    margin: 6px 0;
+}
+
+.msg.assistant .markdown-body strong {
+    color: #e0e0e0;
+}
+
+.msg.assistant .markdown-body table {
+    border-collapse: collapse;
+    margin: 8px 0;
+    font-size: 13px;
+}
+
+.msg.assistant .markdown-body th,
+.msg.assistant .markdown-body td {
+    border: 1px solid #2a2a4a;
+    padding: 6px 10px;
+}
+
+.msg.assistant .markdown-body th {
+    background: #1e1e3e;
+    color: #7eb8ff;
+}
+
+/* Error display */
+.msg-error {
+    margin-top: 8px;
+    padding: 6px 10px;
+    background: #3a1a1a;
+    border: 1px solid #5a2a2a;
+    border-radius: 6px;
+    color: #ff8888;
+    font-size: 13px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.retry-btn {
+    background: #5a2a2a;
+    color: #ff8888;
+    border: 1px solid #7a3a3a;
+    border-radius: 4px;
+    padding: 3px 10px;
+    cursor: pointer;
+    font-size: 12px;
+    white-space: nowrap;
+    transition: background 0.15s;
+}
+
+.retry-btn:hover {
+    background: #7a3a3a;
+}
+
+/* Cursor animation */
+.cursor {
+    display: inline-block;
+    width: 2px;
+    height: 16px;
+    background: #7eb8ff;
+    animation: blink 0.8s infinite;
+    vertical-align: text-bottom;
+    margin-left: 2px;
+}
+
+@keyframes blink {
+
+    0%,
+    50% {
+        opacity: 1;
+    }
+
+    51%,
+    100% {
+        opacity: 0;
+    }
+}
+
+@keyframes slideIn {
+    from {
+        opacity: 0;
+        transform: translateY(10px);
+    }
+
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}

@@ -1,23 +1,24 @@
-output "aks_cluster_name" {
-  value = azurerm_kubernetes_cluster.aks.name
+output "app_url" {
+  description = "Container App URL (HTTPS)"
+  value       = "https://${azurerm_container_app.chatbot.ingress[0].fqdn}"
+}
+
+output "app_name" {
+  description = "Container App name (for deploy script)"
+  value       = azurerm_container_app.chatbot.name
 }
 
 output "acr_login_server" {
-  value = azurerm_container_registry.acr.login_server
+  description = "ACR login server"
+  value       = azurerm_container_registry.acr.login_server
 }
 
 output "openai_endpoint" {
-  value = azurerm_cognitive_account.openai.endpoint
+  description = "Azure OpenAI endpoint"
+  value       = azurerm_cognitive_account.openai.endpoint
 }
 
-output "public_ip" {
-  value = azurerm_public_ip.chatbot.ip_address
-}
-
-output "managed_identity_client_id" {
-  value = azurerm_user_assigned_identity.chatbot.client_id
-}
-
-output "aks_oidc_issuer" {
-  value = azurerm_kubernetes_cluster.aks.oidc_issuer_url
+output "managed_identity_principal_id" {
+  description = "User-assigned managed identity principal ID"
+  value       = azurerm_user_assigned_identity.chatbot.principal_id
 }

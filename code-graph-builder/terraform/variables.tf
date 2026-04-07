@@ -11,37 +11,62 @@ variable "resource_group_name" {
 }
 
 variable "location" {
-  description = "Azure region for resource group and ACR"
+  description = "Azure region for all resources"
   type        = string
   default     = "westus2"
 }
 
-variable "aks_location" {
-  description = "Azure region for AKS, OpenAI, and public IP (must have gpt-4o availability)"
+variable "openai_location" {
+  description = "Azure region for OpenAI (must have gpt-4o availability)"
   type        = string
   default     = "centralus"
 }
 
-variable "aks_name" {
-  description = "AKS cluster name"
-  type        = string
-  default     = "damoy-aks"
-}
-
-variable "aks_dns_prefix" {
-  description = "AKS DNS prefix"
-  type        = string
-  default     = "damoy-aks"
-}
-
 variable "acr_name" {
-  description = "Container registry name"
+  description = "Container registry name (globally unique)"
   type        = string
   default     = "damoyacr"
 }
 
 variable "openai_name" {
-  description = "Azure OpenAI resource name"
+  description = "Azure OpenAI resource name (globally unique)"
   type        = string
   default     = "damoy-openai3"
+}
+
+variable "container_name" {
+  description = "Container instance name (becomes <name>.<location>.azurecontainer.io)"
+  type        = string
+  default     = "codegraph-chatbot"
+}
+
+variable "container_cpu" {
+  description = "CPU cores for the container (1-4)"
+  type        = number
+  default     = 2
+}
+
+variable "container_memory" {
+  description = "Memory in GB for the container (1-16)"
+  type        = number
+  default     = 4
+}
+
+variable "image_tag" {
+  description = "Docker image tag to deploy"
+  type        = string
+  default     = "latest"
+}
+
+variable "auth_username" {
+  description = "HTTP Basic Auth username"
+  type        = string
+  default     = "ai"
+}
+
+variable "auth_password" {
+  description = "HTTP Basic Auth password"
+  type        = string
+  sensitive   = true
+  default     = "ai"
 }

@@ -1,0 +1,155 @@
+.exec-timeline {
+    margin-bottom: 8px;
+    font-size: 12px;
+}
+
+/* Toggle button */
+.exec-toggle {
+    background: none;
+    border: 1px solid #2a2a4a;
+    border-radius: 6px;
+    color: #6b8aaf;
+    cursor: pointer;
+    padding: 4px 10px;
+    font-size: 12px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    transition: background 0.15s;
+}
+
+.exec-toggle:hover {
+    background: #1a1a3e;
+}
+
+.exec-icon {
+    font-size: 14px;
+}
+
+.exec-arrow {
+    font-size: 10px;
+    transition: transform 0.2s;
+    margin-left: auto;
+}
+
+.exec-arrow.expanded {
+    transform: rotate(90deg);
+}
+
+/* Streaming state */
+.exec-streaming-status {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 4px 0;
+}
+
+.exec-active-tool {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.exec-spinner {
+    display: inline-block;
+    width: 12px;
+    height: 12px;
+    border: 2px solid #2a2a4a;
+    border-top-color: #4a9eff;
+    border-radius: 50%;
+    animation: exec-spin 0.8s linear infinite;
+}
+
+@keyframes exec-spin {
+    to {
+        transform: rotate(360deg);
+    }
+}
+
+.exec-active-name {
+    font-style: italic;
+}
+
+.exec-done-count {
+    color: #4a5568;
+}
+
+/* Steps panel */
+.exec-steps {
+    margin-top: 6px;
+    padding: 6px 8px;
+    border: 1px solid #2a2a4a;
+    border-radius: 6px;
+    background: #0d0d1f;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.exec-step-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.exec-round-badge {
+    font-size: 10px;
+    font-weight: 600;
+    padding: 1px 5px;
+    border: 1px solid;
+    border-radius: 4px;
+    color: #8899aa;
+    flex-shrink: 0;
+}
+
+.exec-step-name {
+    width: 110px;
+    flex-shrink: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 11px;
+}
+
+.exec-bar-track {
+    flex: 1;
+    height: 6px;
+    background: #1a1a3a;
+    border-radius: 3px;
+    overflow: hidden;
+}
+
+.exec-bar-fill {
+    height: 100%;
+    border-radius: 3px;
+    transition: width 0.3s ease;
+}
+
+.exec-step-duration {
+    width: 45px;
+    text-align: right;
+    color: #6b8aaf;
+    font-size: 11px;
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    flex-shrink: 0;
+}
+
+/* Fallback list (legacy toolCalls) */
+.exec-fallback-list {
+    margin: 6px 0 0 8px;
+    padding: 0;
+    list-style: none;
+}
+
+.exec-fallback-item {
+    color: #6b8aaf;
+    padding: 2px 0;
+    font-style: italic;
+    font-size: 12px;
+}
+
+.exec-fallback-item::before {
+    content: "\2022  ";
+    color: #3a3a5a;
+}

@@ -1,0 +1,51 @@
+.app-header {
+    background: linear-gradient(135deg, #1a1a3e 0%, #0d2137 100%);
+    padding: 16px 24px;
+    border-bottom: 1px solid #2a2a4a;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-shrink: 0;
+}
+
+.header-left h1 {
+    font-size: 18px;
+    color: #7eb8ff;
+    margin: 0;
+    font-weight: 600;
+}
+
+.stats {
+    font-size: 12px;
+    color: #888;
+    margin-top: 4px;
+}
+
+.header-actions {
+    display: flex;
+    gap: 8px;
+}
+
+.header-btn {
+    background: #1a1a3e;
+    color: #7eb8ff;
+    border: 1px solid #2a2a4a;
+    border-radius: 6px;
+    padding: 6px 12px;
+    font-size: 12px;
+    cursor: pointer;
+    transition: background 0.15s;
+}
+
+.header-btn:hover {
+    background: #2a2a5a;
+}
+
+.header-btn-danger {
+    color: #ff8888;
+    border-color: #5a2a2a;
+}
+
+.header-btn-danger:hover {
+    background: #3a1a1a;
+}

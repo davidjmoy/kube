@@ -7,10 +7,11 @@ Streams responses token-by-token via Server-Sent Events (SSE).
 import os
 import re
 import json
+import time
 import secrets
-import subprocess
 import logging
-from typing import AsyncGenerator, Optional
+import subprocess
+from typing import AsyncGenerator
 from functools import lru_cache
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
@@ -20,7 +21,7 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("chatbot")
 
-from fastapi import FastAPI, HTTPException, Query, BackgroundTasks, Depends, status
+from fastapi import FastAPI, HTTPException, Query, Request, Depends, status
 from fastapi.responses import StreamingResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -28,12 +29,14 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
 import asyncio
 
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+
 from openai import AsyncAzureOpenAI
 from azure.identity import DefaultAzureCredential, get_bearer_token_provider
 
 from src.graph import CodeGraphSerializer
-from src.query import GraphQuery
-from src.file_index import FileIndex
 from src.doc_index import DocIndex
 from pathlib import Path
 
@@ -47,6 +50,12 @@ DOCS_ROOT = Path(os.getenv("DOCS_ROOT", r"c:\Users\david\repos\website\content\e
 GITHUB_REPO_URL = os.getenv("GITHUB_REPO_URL", "https://github.com/kubernetes/kubernetes")
 GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "master")
 DOCS_BASE_URL = os.getenv("DOCS_BASE_URL", "https://kubernetes.io")
+
+ALLOWED_ORIGINS = [
+    o.strip()
+    for o in os.getenv("ALLOWED_ORIGINS", "http://localhost:3000,http://localhost:8000").split(",")
+    if o.strip()
+]
 
 class Settings:
     """App settings from environment variables."""
@@ -67,40 +76,50 @@ class Settings:
 
 settings = Settings()
 
+
+def _validate_config():
+    """Validate required env vars at startup with clear errors."""
+    errors = []
+    if settings.azure_endpoint == "https://YOUR.openai.azure.com/":
+        errors.append("AZURE_OPENAI_ENDPOINT is not configured (still set to placeholder)")
+    if not settings.graph_path.exists():
+        errors.append(f"GRAPH_PATH={settings.graph_path} does not exist -- run 'python main.py analyze' first")
+    if not REPO_ROOT.exists():
+        errors.append(f"REPO_ROOT={REPO_ROOT} does not exist")
+    if errors:
+        for e in errors:
+            logger.error(f"CONFIG ERROR: {e}")
+        # Don't exit — log warnings so the service can still start in degraded mode
+        logger.warning(f"Startup has {len(errors)} config warning(s). Some features may not work.")
+
+
+_validate_config()
+
 # ============================================================================
 # Initialize FastAPI and clients
 # ============================================================================
-
-# File-content index (SQLite FTS5) — created before app so lifespan can use it
-INDEX_DB = Path(os.getenv("INDEX_DB", "output/file-index.db"))
-file_index = FileIndex(INDEX_DB, REPO_ROOT)
 
 # Documentation index
 DOCS_INDEX_DB = Path(os.getenv("DOCS_INDEX_DB", "output/doc-index.db"))
 doc_index = DocIndex(DOCS_INDEX_DB, DOCS_ROOT)
 
+# Ripgrep binary (used for grep_code tool)
+RIPGREP_BIN = os.getenv("RIPGREP_BIN", "rg")
+
 
 @asynccontextmanager
 async def lifespan(app):
-    """Startup: ensure file-content and doc indexes exist."""
-    if not file_index.exists:
-        logger.info("File-content index not found \u2014 building (~20-60s) \u2026")
-        stats = file_index.build()
-        logger.info(f"Index ready: {stats}")
-    else:
-        logger.info("File-content index loaded")
-
+    """Startup: ensure doc index exists."""
     if doc_index.exists:
         logger.info("Doc index loaded (pre-built)")
     elif DOCS_ROOT.exists():
         logger.info("Doc index not found \u2014 building \u2026")
-        stats = doc_index.build()
+        stats = await asyncio.to_thread(doc_index.build)
         logger.info(f"Doc index ready: {stats}")
     else:
         logger.info(f"No doc index and docs root not found ({DOCS_ROOT}), doc search disabled")
 
     yield
-    file_index.close()
     doc_index.close()
 
 
@@ -114,11 +133,16 @@ app = FastAPI(
 # Add CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Add rate limiting
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # ---- Basic Auth ----
 _AUTH_USER = os.getenv("AUTH_USERNAME", "")
@@ -145,11 +169,23 @@ def verify_auth(credentials: HTTPBasicCredentials = Depends(security)):
             headers={"WWW-Authenticate": "Basic"},
         )
 
-# Serve the chat UI at root
+# ---- Static files (React build) ----
+STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
+
 @app.get("/", response_class=HTMLResponse, dependencies=[Depends(verify_auth)])
 async def root():
-    html_path = Path(__file__).resolve().parent.parent / "static" / "index.html"
+    """Serve the React frontend (or a helpful message if not built yet)."""
+    html_path = STATIC_DIR / "index.html"
+    if not html_path.exists():
+        return HTMLResponse(
+            content="<h1>Frontend not built</h1><p>Run <code>cd frontend && npm install && npm run build</code></p>",
+            status_code=503,
+        )
     return HTMLResponse(content=html_path.read_text(encoding="utf-8"))
+
+# Mount React build's asset files (JS, CSS, media)
+if (STATIC_DIR / "static").exists():
+    app.mount("/static", StaticFiles(directory=STATIC_DIR / "static"), name="react-assets")
 
 # Initialize Azure OpenAI with DefaultAzureCredential (uses az login)
 credential = DefaultAzureCredential()
@@ -175,11 +211,59 @@ def get_graph_query():
     return graph_data
 
 
-@app.post("/index/rebuild", dependencies=[Depends(verify_auth)])
-async def rebuild_index():
-    """Force-rebuild the file-content index."""
-    stats = file_index.build()
-    return {"status": "rebuilt", **stats}
+@lru_cache(maxsize=1)
+def get_symbol_suggestion_index() -> dict:
+    """Build a compact in-memory index for type-ahead suggestions."""
+    graph_data = get_graph_query()
+    functions = graph_data.get("functions", {})
+    types = graph_data.get("types", {})
+
+    type_items = []
+    for type_node in types.values():
+        type_items.append({
+            "kind": "class",
+            "name": type_node.get("name", ""),
+            "package": type_node.get("package", ""),
+            "insert_text": type_node.get("name", ""),
+            "location": type_node.get("location", {}),
+        })
+
+    method_items = []
+    for fn in functions.values():
+        if not fn.get("is_method"):
+            continue
+        name = fn.get("name", "")
+        receiver = fn.get("receiver") or ""
+        display_name = f"{receiver}.{name}" if receiver else name
+        method_items.append({
+            "kind": "method",
+            "name": display_name,
+            "method_name": name,
+            "receiver": receiver,
+            "package": fn.get("package", ""),
+            "insert_text": display_name,
+            "location": fn.get("location", {}),
+        })
+
+    return {"types": type_items, "methods": method_items}
+
+
+def _suggestion_score(query: str, candidate: str) -> int:
+    """Rank suggestions by best match quality (higher is better)."""
+    q = query.lower()
+    c = candidate.lower()
+
+    if c == q:
+        return 100
+    if c.startswith(q):
+        return 80
+    dot_token = c.split(".")[-1]
+    if dot_token.startswith(q):
+        return 70
+    idx = c.find(q)
+    if idx >= 0:
+        return max(10, 60 - idx)
+    return 0
 
 
 # ============================================================================
@@ -344,6 +428,48 @@ TOOLS = [
                 "required": ["file_path"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "find_files",
+            "description": "Find files by glob pattern in the Kubernetes repo. Use this when you don't know the exact file path but know a naming pattern.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "Glob pattern to match. Examples: '*_test.go', '*.yaml', 'BUILD', 'Makefile'"
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Subdirectory to search within (relative to repo root). Default: '' (entire repo)"
+                    }
+                },
+                "required": ["pattern"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_git_history",
+            "description": "Get recent git commits for a file or directory. Use this to understand recent changes, who modified code, and when.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "File or directory path relative to repo root. Example: 'pkg/kubelet/kubelet.go'"
+                    },
+                    "max_count": {
+                        "type": "integer",
+                        "description": "Maximum number of commits to return. Default: 15"
+                    }
+                },
+                "required": ["file_path"]
+            }
+        }
     }
 ]
 
@@ -352,9 +478,21 @@ TOOLS = [
 # Tool execution
 # ============================================================================
 
-def execute_tool(name: str, arguments: dict) -> str:
-    """Execute a tool call and return the result as a string."""
+def _safe_resolve(base: Path, user_path: str) -> Path | None:
+    """Resolve user_path under base, returning None if it escapes."""
+    try:
+        resolved = (base / user_path).resolve()
+        if resolved.is_relative_to(base.resolve()):
+            return resolved
+    except (ValueError, OSError):
+        pass
+    return None
+
+
+def execute_tool(name: str, arguments: dict) -> dict:
+    """Execute a tool call and return the result with timing metadata."""
     logger.info(f"Tool call: {name}({json.dumps(arguments, ensure_ascii=False)[:200]})")
+    start = time.time()
     try:
         if name == "grep_code":
             result = _tool_grep(arguments)
@@ -370,13 +508,20 @@ def execute_tool(name: str, arguments: dict) -> str:
             result = _tool_search_docs(arguments)
         elif name == "read_doc":
             result = _tool_read_doc(arguments)
+        elif name == "find_files":
+            result = _tool_find_files(arguments)
+        elif name == "get_git_history":
+            result = _tool_get_git_history(arguments)
         else:
             result = f"Unknown tool: {name}"
-        logger.info(f"Tool {name} returned {len(result)} chars")
-        return result
+        duration_ms = int((time.time() - start) * 1000)
+        logger.info(f"Tool {name} returned {len(result)} chars in {duration_ms}ms")
+        return {"result": result, "duration_ms": duration_ms, "result_chars": len(result)}
     except Exception as e:
+        duration_ms = int((time.time() - start) * 1000)
         logger.exception(f"Tool {name} failed")
-        return f"Error executing {name}: {e}"
+        error_msg = f"Error executing {name}: {e}"
+        return {"result": error_msg, "duration_ms": duration_ms, "result_chars": len(error_msg)}
 
 
 def _graph_files_for_pattern(pattern: str, path: str) -> list[str]:
@@ -405,85 +550,110 @@ def _graph_files_for_pattern(pattern: str, path: str) -> list[str]:
         return []
 
 
-def _grep_files(file_paths: list[Path], pat: re.Pattern, limit: int) -> list[str]:
-    """Grep a specific set of files, returning up to *limit* matches."""
-    matches: list[str] = []
-    for go_file in file_paths:
-        rel = str(go_file.relative_to(REPO_ROOT)).replace("\\", "/")
-        try:
-            with open(go_file, "r", encoding="utf-8", errors="ignore") as f:
-                for line_no, line in enumerate(f, 1):
-                    if pat.search(line):
-                        matches.append(f"{rel}:{line_no}: {line.rstrip()}")
-                        if len(matches) >= limit:
-                            return matches
-        except (OSError, PermissionError):
-            continue
-    return matches
+def _run_ripgrep(pattern: str, search_dir: Path, include: str, max_matches: int, context_lines: int = 2) -> str:
+    """Run ripgrep subprocess and return formatted output."""
+    args = [
+        RIPGREP_BIN,
+        "--no-heading",
+        "--line-number",
+        "--color", "never",
+        "--ignore-case",
+        "--max-count", "10",
+        "--glob", include,
+        "--glob", "!vendor/**",
+        "--glob", "!third_party/**",
+        "--glob", "!*_generated*",
+    ]
+    if context_lines:
+        args.extend(["-C", str(context_lines)])
+    args.extend(["--", pattern, str(search_dir)])
+
+    try:
+        result = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            cwd=str(REPO_ROOT),
+        )
+        # rg exit code 1 = no matches (not an error)
+        if result.returncode == 1:
+            return ""
+        if result.returncode != 0:
+            logger.warning(f"ripgrep error (exit {result.returncode}): {result.stderr[:200]}")
+            return ""
+        # Truncate output to prevent megabytes from flooding context
+        output = result.stdout
+        if len(output) > 8000:
+            output = output[:8000]
+        return output
+    except FileNotFoundError:
+        logger.warning(f"ripgrep binary not found at '{RIPGREP_BIN}', falling back to Python grep")
+        return ""
+    except subprocess.TimeoutExpired:
+        logger.warning("ripgrep timed out after 30s")
+        return ""
 
 
 def _tool_grep(args: dict) -> str:
-    """Grep the Kubernetes source code, using the code graph to narrow files first."""
+    """Grep the Kubernetes source code using ripgrep, with graph-guided fallback."""
     pattern = args["pattern"]
     path = args.get("path", "pkg")
     include = args.get("include_pattern", "*.go")
 
-    search_dir = REPO_ROOT / path
+    resolved = _safe_resolve(REPO_ROOT, path)
+    if resolved is None:
+        return "Error: path not allowed (outside repo root)"
+    search_dir = resolved
     if not search_dir.exists():
         return f"Directory not found: {path}"
 
     MAX_MATCHES = 60
     DISPLAY = 50
-    pat = re.compile(re.escape(pattern), re.IGNORECASE)
+    MAX_CHARS = 6000
 
     try:
-        # --- Phase 0: FTS index lookup (sub-millisecond) ---
-        if file_index.exists and include == "*.go":
-            path_prefix = path.replace("\\", "/").rstrip("/") + "/"
-            rows = file_index.search(pattern, path_prefix=path_prefix, limit=MAX_MATCHES)
-            if rows:
-                logger.info(f"FTS index returned {len(rows)} matches")
-                matches = [f"{r[0]}:{r[1]}: {r[2]}" for r in rows]
-                if len(matches) >= MAX_MATCHES:
-                    return (
-                        "(indexed search)\n"
-                        + "\n".join(matches[:DISPLAY])
-                        + f"\n\n... (truncated at {DISPLAY} of {MAX_MATCHES}+ matches)"
-                    )
-                return f"(indexed search)\n" + "\n".join(matches)
+        # --- Phase 0: ripgrep (fast, full-featured) ---
+        rg_output = _run_ripgrep(pattern, search_dir, include, MAX_MATCHES)
+        if rg_output:
+            # Make paths relative to REPO_ROOT for cleaner output
+            repo_str = str(REPO_ROOT).replace("\\", "/")
+            rg_output = rg_output.replace(repo_str + "/", "").replace(repo_str, "")
+            lines = rg_output.rstrip().split("\n")
+            if len(lines) > DISPLAY:
+                output = "\n".join(lines[:DISPLAY])
+                return f"(ripgrep)\n{output}\n\n... (showing {DISPLAY} of {len(lines)} lines, narrow your search)"
+            truncated = rg_output[:MAX_CHARS]
+            if len(rg_output) > MAX_CHARS:
+                truncated += f"\n\n... (truncated at {MAX_CHARS} chars)"
+            return f"(ripgrep)\n{truncated}"
 
-        # --- Phase 1: graph-guided search (fast, targeted) ---
+        # --- Phase 1: graph-guided Python search (fallback if rg not available) ---
+        pat = re.compile(re.escape(pattern), re.IGNORECASE)
         graph_files = _graph_files_for_pattern(pattern, path)
         if graph_files:
             logger.info(f"Graph narrowed grep to {len(graph_files)} files")
             resolved = [REPO_ROOT / f for f in graph_files if (REPO_ROOT / f).is_file()]
-            matches = _grep_files(resolved, pat, MAX_MATCHES)
+            matches = []
+            for go_file in resolved:
+                rel = str(go_file.relative_to(REPO_ROOT)).replace("\\", "/")
+                try:
+                    with open(go_file, "r", encoding="utf-8", errors="ignore") as f:
+                        for line_no, line in enumerate(f, 1):
+                            if pat.search(line):
+                                matches.append(f"{rel}:{line_no}: {line.rstrip()}")
+                                if len(matches) >= MAX_MATCHES:
+                                    break
+                except (OSError, PermissionError):
+                    continue
+                if len(matches) >= MAX_MATCHES:
+                    break
             if matches:
                 if len(matches) >= MAX_MATCHES:
-                    return (
-                        "(graph-guided search)\n"
-                        + "\n".join(matches[:DISPLAY])
-                        + f"\n\n... (truncated at {DISPLAY} of {MAX_MATCHES}+ matches)"
-                    )
+                    return "(graph-guided search)\n" + "\n".join(matches[:DISPLAY]) + f"\n\n... (truncated at {DISPLAY} of {MAX_MATCHES}+ matches)"
                 return f"(graph-guided search, {len(graph_files)} files)\n" + "\n".join(matches)
 
-        # --- Phase 2: fallback file scan (bounded) ---
-        logger.info(f"No index/graph hits, falling back to rglob in {path}")
-        all_files: list[Path] = []
-        for go_file in search_dir.rglob(include):
-            rel = str(go_file.relative_to(REPO_ROOT))
-            if any(skip in rel.lower() for skip in ["vendor/", "third_party/", "_generated"]):
-                continue
-            all_files.append(go_file)
-
-        matches = _grep_files(all_files, pat, MAX_MATCHES)
-
-        if not matches:
-            return f"No matches found for '{pattern}' in {path}/{include}"
-
-        if len(matches) >= MAX_MATCHES:
-            return "\n".join(matches[:DISPLAY]) + f"\n\n... (truncated at {DISPLAY} of {MAX_MATCHES}+ matches, narrow your search)"
-        return "\n".join(matches)
+        return f"No matches found for '{pattern}' in {path}/{include}"
     except Exception as e:
         return f"Grep error: {e}"
 
@@ -491,21 +661,25 @@ def _tool_grep(args: dict) -> str:
 def _tool_read_file(args: dict) -> str:
     """Read lines from a file in the repo."""
     file_path = args["file_path"]
-    # Sanitize: no path traversal
-    if ".." in file_path:
-        return "Error: path traversal not allowed"
 
-    full_path = REPO_ROOT / file_path
-    if not full_path.exists():
+    resolved = _safe_resolve(REPO_ROOT, file_path)
+    if resolved is None:
+        return "Error: path not allowed (outside repo root)"
+    if not resolved.exists():
         return f"File not found: {file_path}"
-    if not full_path.is_file():
+    if not resolved.is_file():
         return f"Not a file: {file_path}"
 
     start = args.get("start_line", 1)
     end = args.get("end_line", start + 100)
 
+    # Cap read window to 200 lines to avoid flooding context
+    MAX_READ_LINES = 200
+    if end - start > MAX_READ_LINES:
+        end = start + MAX_READ_LINES
+
     try:
-        with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
+        with open(resolved, "r", encoding="utf-8", errors="ignore") as f:
             all_lines = f.readlines()
 
         start = max(1, start)
@@ -609,10 +783,15 @@ def _tool_search_graph(args: dict) -> str:
 def _tool_list_directory(args: dict) -> str:
     """List directory contents in the repo."""
     rel_path = args.get("path", "")
-    if ".." in rel_path:
-        return "Error: path traversal not allowed"
 
-    dir_path = REPO_ROOT / rel_path if rel_path else REPO_ROOT
+    if rel_path:
+        resolved = _safe_resolve(REPO_ROOT, rel_path)
+        if resolved is None:
+            return "Error: path not allowed (outside repo root)"
+        dir_path = resolved
+    else:
+        dir_path = REPO_ROOT
+
     if not dir_path.exists():
         return f"Directory not found: {rel_path}"
 
@@ -626,14 +805,6 @@ def _tool_list_directory(args: dict) -> str:
 
     header = f"Contents of {rel_path or '/'}:\n"
     return header + "\n".join(lines)
-
-
-def _github_url(file_path: str, line: int | None = None) -> str:
-    """Build a GitHub URL for a source file."""
-    url = f"{GITHUB_REPO_URL}/blob/{GITHUB_BRANCH}/{file_path}"
-    if line:
-        url += f"#L{line}"
-    return url
 
 
 def _tool_search_docs(args: dict) -> str:
@@ -664,8 +835,9 @@ def _tool_search_docs(args: dict) -> str:
 def _tool_read_doc(args: dict) -> str:
     """Read full content of a documentation page."""
     file_path = args["file_path"]
-    if ".." in file_path:
-        return "Error: path traversal not allowed"
+
+    if DOCS_ROOT.exists() and _safe_resolve(DOCS_ROOT, file_path) is None:
+        return "Error: path not allowed (outside docs root)"
 
     if not doc_index.exists:
         return "Documentation index not available."
@@ -683,6 +855,72 @@ def _tool_read_doc(args: dict) -> str:
     return header + content
 
 
+def _tool_find_files(args: dict) -> str:
+    """Find files matching a glob pattern in the repo."""
+    pattern = args["pattern"]
+    path = args.get("path", "")
+    if path:
+        resolved = _safe_resolve(REPO_ROOT, path)
+        if resolved is None:
+            return "Error: path not allowed (outside repo root)"
+        search_dir = resolved
+    else:
+        search_dir = REPO_ROOT
+
+    if not search_dir.exists():
+        return f"Directory not found: {path}"
+
+    MAX_RESULTS = 50
+    matches = []
+    for f in search_dir.rglob(pattern):
+        rel = str(f.relative_to(REPO_ROOT)).replace("\\", "/")
+        if any(skip in rel.lower() for skip in ["vendor/", "third_party/", "_generated", "node_modules/"]):
+            continue
+        matches.append(rel)
+        if len(matches) >= MAX_RESULTS:
+            break
+
+    if not matches:
+        return f"No files matching '{pattern}' in {path or '/'}"
+    result = f"Found {len(matches)} file(s) matching '{pattern}':\n"
+    result += "\n".join(f"  {m}" for m in sorted(matches))
+    if len(matches) >= MAX_RESULTS:
+        result += f"\n\n... (truncated at {MAX_RESULTS}, narrow your search)"
+    return result
+
+
+def _tool_get_git_history(args: dict) -> str:
+    """Get recent git commits for a file or directory."""
+    file_path = args["file_path"]
+    max_count = min(args.get("max_count", 15), 30)
+
+    resolved = _safe_resolve(REPO_ROOT, file_path)
+    if resolved is None:
+        return "Error: path not allowed (outside repo root)"
+    if not resolved.exists():
+        return f"Path not found: {file_path}"
+
+    try:
+        rel_path = str(resolved.relative_to(REPO_ROOT.resolve())).replace("\\", "/")
+        result = subprocess.run(
+            ["git", "log", f"--oneline", f"-n{max_count}", "--", rel_path],
+            cwd=str(REPO_ROOT),
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if result.returncode != 0:
+            return f"Git error: {result.stderr.strip()}"
+        output = result.stdout.strip()
+        if not output:
+            return f"No git history found for '{file_path}'"
+        return f"Recent commits for {file_path}:\n{output}"
+    except subprocess.TimeoutExpired:
+        return "Git log timed out (15s limit)"
+    except FileNotFoundError:
+        return "Git is not installed or not in PATH"
+
+
 # ============================================================================
 # System prompt
 # ============================================================================
@@ -697,6 +935,8 @@ You have tools to search and read both source code and documentation. USE THEM. 
 - find_callers: Query the code graph for who calls a function
 - search_graph: Search the code graph for functions by name
 - list_directory: Browse the repo structure
+- find_files: Find files by glob pattern (e.g. '*_test.go', 'Makefile')
+- get_git_history: See recent commits for a file or directory
 
 **Documentation Tools:**
 - search_docs: Search the official Kubernetes docs by topic
@@ -707,10 +947,17 @@ You have tools to search and read both source code and documentation. USE THEM. 
 - For "how do I configure X" or "what is the concept of X" → use doc tools
 - For architecture questions → use both: docs for overview, code for details
 
-**Workflow:**
-1. Use search_graph or grep_code to find code; use search_docs for documentation
-2. Use read_file to read source code, read_doc to read full docs
-3. Use find_callers to trace call chains in the code graph
+**Strategy:**
+1. Search first (grep_code or search_graph), then read the results (read_file)
+2. Use find_files when you don't know the exact path but know a naming pattern
+3. Use get_git_history to understand recent changes to a file
+4. Follow dependency chains: find_callers → read_file on callers → repeat
+5. Don't stop at the first result — check negatives and verify assumptions
+
+**Response format:**
+- Start with a brief answer (TL;DR)
+- Then provide details with code references
+- End with "Watch out for" notes if relevant
 
 **Source code references:**
 When citing source code, ALWAYS format file references as GitHub links:
@@ -771,30 +1018,84 @@ async def info():
 
 
 # ============================================================================
+# Input validation
+# ============================================================================
+
+MAX_MESSAGE_LENGTH = 10_000
+MAX_HISTORY_MESSAGES = 20
+MAX_HISTORY_MSG_LENGTH = 5_000
+
+
+def _sanitize_request(request: ChatRequest) -> ChatRequest:
+    """Truncate history and validate message length."""
+    # Truncate history to last N messages
+    if len(request.conversation_history) > MAX_HISTORY_MESSAGES:
+        request.conversation_history = request.conversation_history[-MAX_HISTORY_MESSAGES:]
+    # Truncate individual history messages
+    for msg in request.conversation_history:
+        if len(msg.content) > MAX_HISTORY_MSG_LENGTH:
+            msg.content = msg.content[:MAX_HISTORY_MSG_LENGTH] + "\n... (truncated)"
+    return request
+
+
+# ============================================================================
 # Streaming Chat Endpoint
 # ============================================================================
 
+def _tool_description(name: str, args: dict) -> str:
+    """Build a human-readable summary of a tool call."""
+    if name == "grep_code":
+        return f"Searching for '{args.get('pattern', '')}'"
+    elif name == "read_file":
+        return f"Reading {args.get('file_path', '')}"
+    elif name == "find_callers":
+        return f"Finding callers of {args.get('function_name', '')}"
+    elif name == "search_graph":
+        return f"Searching graph for '{args.get('query', '')}'"
+    elif name == "list_directory":
+        return f"Listing {args.get('path', '/')}"
+    elif name == "search_docs":
+        return f"Searching docs for '{args.get('query', '')}'"
+    elif name == "read_doc":
+        return f"Reading doc: {args.get('file_path', '')}"
+    elif name == "find_files":
+        return f"Finding files matching '{args.get('pattern', '')}'"
+    elif name == "get_git_history":
+        return f"Git history for {args.get('file_path', '')}"
+    return name
+
+
 async def generate_streaming_response(request: ChatRequest) -> AsyncGenerator[str, None]:
     """Generate streaming chat response with tool-calling loop."""
-    
+
     try:
+        # Validate message length
+        if len(request.message) > MAX_MESSAGE_LENGTH:
+            yield f"data: {json.dumps({'type': 'error', 'message': f'Message too long ({len(request.message)} chars). Maximum is {MAX_MESSAGE_LENGTH}.'})}\n\n"
+            return
+
+        request = _sanitize_request(request)
+
         # Build messages
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-        
+
         for msg in request.conversation_history:
             messages.append({"role": msg.role, "content": msg.content})
-        
+
         messages.append({"role": "user", "content": request.message})
         logger.info(f"Chat request: {request.message[:100]}")
 
-        max_tool_rounds = 8  # prevent infinite loops
+        max_tool_rounds = 8
         tool_round = 0
+        all_steps = []
+        loop_start = time.time()
 
         while tool_round < max_tool_rounds:
             tool_round += 1
             logger.info(f"LLM call round {tool_round}")
 
-            # Call LLM (non-streaming first to check for tool calls)
+            # First, make a non-streaming call to check for tool calls
+            # (streaming + tool_calls don't mix well with Azure OpenAI)
             response = await async_client.chat.completions.create(
                 model=settings.deployment_name,
                 messages=messages,
@@ -803,6 +1104,10 @@ async def generate_streaming_response(request: ChatRequest) -> AsyncGenerator[st
                 temperature=0.3,
             )
 
+            if not response.choices:
+                yield f"data: {json.dumps({'type': 'error', 'message': 'No response from LLM (possibly content filter)'})}\n\n"
+                return
+
             choice = response.choices[0]
 
             # If the model wants to call tools, execute them
@@ -810,69 +1115,86 @@ async def generate_streaming_response(request: ChatRequest) -> AsyncGenerator[st
                 # Add the assistant message with tool calls
                 messages.append(choice.message)
 
-                # Tell the user which tools are being used
-                for tc in choice.message.tool_calls:
-                    args = json.loads(tc.function.arguments)
-                    if tc.function.name == "grep_code":
-                        desc = f"Searching for '{args.get('pattern', '')}'"
-                    elif tc.function.name == "read_file":
-                        desc = f"Reading {args.get('file_path', '')}"
-                    elif tc.function.name == "find_callers":
-                        desc = f"Finding callers of {args.get('function_name', '')}"
-                    elif tc.function.name == "search_graph":
-                        desc = f"Searching graph for '{args.get('query', '')}'"
-                    elif tc.function.name == "list_directory":
-                        desc = f"Listing {args.get('path', '/')}"
-                    elif tc.function.name == "search_docs":
-                        desc = f"Searching docs for '{args.get('query', '')}'"
-                    elif tc.function.name == "read_doc":
-                        desc = f"Reading doc: {args.get('file_path', '')}"
-                    else:
-                        desc = tc.function.name
-                    status_msg = {"type": "status", "message": desc}
-                    yield f"data: {json.dumps(status_msg)}\n\n"
-
-                # Execute each tool call
+                # Execute each tool call with structured events
                 for tool_call in choice.message.tool_calls:
                     fn_name = tool_call.function.name
-                    fn_args = json.loads(tool_call.function.arguments)
+                    try:
+                        fn_args = json.loads(tool_call.function.arguments)
+                    except json.JSONDecodeError:
+                        fn_args = {}
+                        logger.warning(f"Bad JSON from LLM for tool {fn_name}: {tool_call.function.arguments[:100]}")
+                    desc = _tool_description(fn_name, fn_args)
 
-                    result = execute_tool(fn_name, fn_args)
+                    # Emit tool_start
+                    yield f"data: {json.dumps({'type': 'tool_start', 'name': fn_name, 'args_summary': desc, 'round': tool_round})}\n\n"
+
+                    # Run tool in thread to avoid blocking the event loop
+                    ret = await asyncio.to_thread(execute_tool, fn_name, fn_args)
+
+                    # Emit tool_end
+                    yield f"data: {json.dumps({'type': 'tool_end', 'name': fn_name, 'duration_ms': ret['duration_ms'], 'result_chars': ret['result_chars'], 'round': tool_round})}\n\n"
+
+                    all_steps.append({
+                        "name": fn_name,
+                        "args_summary": desc,
+                        "duration_ms": ret["duration_ms"],
+                        "result_chars": ret["result_chars"],
+                        "round": tool_round,
+                        "status": "success" if not ret["result"].startswith("Error") else "error",
+                    })
 
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tool_call.id,
-                        "content": result
+                        "content": ret["result"]
                     })
 
-                # Loop back for the next LLM call
                 continue
 
-            # No tool calls — we have the final answer already
+            # No tool calls — stream the final answer token-by-token
             final_text = choice.message.content or ""
 
-            # Send it in chunks to simulate streaming
-            chunk_size = 4
-            for i in range(0, len(final_text), chunk_size):
-                token = final_text[i : i + chunk_size]
-                yield f"data: {json.dumps({'token': token})}\n\n"
-                await asyncio.sleep(0.01)
+            # Re-call with stream=True for genuine token-by-token delivery
+            stream_response = await async_client.chat.completions.create(
+                model=settings.deployment_name,
+                messages=messages,
+                max_tokens=settings.max_tokens,
+                temperature=0.3,
+                stream=True,
+            )
+            async for chunk in stream_response:
+                if chunk.choices and chunk.choices[0].delta.content:
+                    token = chunk.choices[0].delta.content
+                    yield f"data: {json.dumps({'token': token})}\n\n"
 
             break
 
+        # Emit execution trace summary
+        total_duration_ms = int((time.time() - loop_start) * 1000)
+        if all_steps:
+            trace = {
+                "type": "trace",
+                "rounds": tool_round,
+                "total_duration_ms": total_duration_ms,
+                "total_tool_calls": len(all_steps),
+                "steps": all_steps,
+            }
+            yield f"data: {json.dumps(trace)}\n\n"
+
         yield "data: {\"type\": \"complete\"}\n\n"
-        
+
     except Exception as e:
         error_msg = {"type": "error", "message": str(e)}
         yield f"data: {json.dumps(error_msg)}\n\n"
 
 
 @app.post("/chat/stream", dependencies=[Depends(verify_auth)])
-async def chat_stream(request: ChatRequest):
+@limiter.limit("20/minute")
+async def chat_stream(request: Request, chat_request: ChatRequest):
     """Stream chat response with code context.
-    
+
     Streams tokens one at a time via Server-Sent Events.
-    
+
     Example response:
     data: {"token": "The"}
     data: {"token": " Kubernetes"}
@@ -880,7 +1202,7 @@ async def chat_stream(request: ChatRequest):
     data: {"type": "complete"}
     """
     return StreamingResponse(
-        generate_streaming_response(request),
+        generate_streaming_response(chat_request),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -894,14 +1216,20 @@ async def chat_stream(request: ChatRequest):
 # ============================================================================
 
 @app.post("/chat", dependencies=[Depends(verify_auth)])
-async def chat(request: ChatRequest):
+@limiter.limit("20/minute")
+async def chat(request: Request, chat_request: ChatRequest):
     """Non-streaming chat endpoint with tool-calling."""
-    
+
+    if len(chat_request.message) > MAX_MESSAGE_LENGTH:
+        raise HTTPException(status_code=400, detail=f"Message too long ({len(chat_request.message)} chars). Maximum is {MAX_MESSAGE_LENGTH}.")
+
+    chat_request = _sanitize_request(chat_request)
+
     try:
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-        for msg in request.conversation_history:
+        for msg in chat_request.conversation_history:
             messages.append({"role": msg.role, "content": msg.content})
-        messages.append({"role": "user", "content": request.message})
+        messages.append({"role": "user", "content": chat_request.message})
 
         max_rounds = 8
         for _ in range(max_rounds):
@@ -913,17 +1241,23 @@ async def chat(request: ChatRequest):
                 temperature=0.3,
             )
 
+            if not response.choices:
+                raise HTTPException(status_code=502, detail="No response from LLM (possibly content filter)")
+
             choice = response.choices[0]
             if choice.finish_reason == "tool_calls" and choice.message.tool_calls:
                 messages.append(choice.message)
                 for tool_call in choice.message.tool_calls:
                     fn_name = tool_call.function.name
-                    fn_args = json.loads(tool_call.function.arguments)
-                    result = execute_tool(fn_name, fn_args)
+                    try:
+                        fn_args = json.loads(tool_call.function.arguments)
+                    except json.JSONDecodeError:
+                        fn_args = {}
+                    ret = await asyncio.to_thread(execute_tool, fn_name, fn_args)
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tool_call.id,
-                        "content": result
+                        "content": ret["result"]
                     })
                 continue
 
@@ -937,7 +1271,7 @@ async def chat(request: ChatRequest):
             }
 
         return {"response": "Reached maximum tool rounds without a final answer.", "usage": {}}
-    
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -970,6 +1304,50 @@ async def graph_search(query: str = Query(..., min_length=1)):
                 for fid, f in matches
             ]
         }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/graph/suggest", dependencies=[Depends(verify_auth)])
+async def graph_suggest(
+    q: str = Query(..., min_length=1, max_length=120),
+    limit: int = Query(10, ge=1, le=25),
+):
+    """Type-ahead suggestions for class/type and method names."""
+    try:
+        query = q.strip()
+        if not query:
+            return {"query": q, "results": []}
+
+        index = get_symbol_suggestion_index()
+        candidates = index["types"] + index["methods"]
+
+        seen = set()
+        scored = []
+        for item in candidates:
+            score = _suggestion_score(query, item.get("name", ""))
+            if score <= 0:
+                continue
+            key = (item.get("kind"), item.get("name"), item.get("package"))
+            if key in seen:
+                continue
+            seen.add(key)
+            scored.append((score, item))
+
+        scored.sort(key=lambda pair: (-pair[0], pair[1].get("name", "").lower()))
+
+        results = []
+        for score, item in scored[:limit]:
+            results.append({
+                "kind": item["kind"],
+                "name": item["name"],
+                "package": item.get("package", ""),
+                "insert_text": item.get("insert_text", item["name"]),
+                "location": item.get("location", {}),
+                "score": score,
+            })
+
+        return {"query": query, "results": results}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

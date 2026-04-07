@@ -46,6 +46,9 @@ terraform/.terraform/
 frontend/node_modules/
 frontend/build/
 
+# React build output (served by backend)
+static/
+
 # Testing
 .pytest_cache/
 .coverage

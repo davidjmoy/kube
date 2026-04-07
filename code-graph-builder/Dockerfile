@@ -1,3 +1,14 @@
+# ---- Build stage: React frontend ----
+FROM node:18-alpine AS frontend-build
+
+WORKDIR /app
+
+COPY frontend/package.json frontend/package-lock.json* ./
+RUN npm ci || npm install
+
+COPY frontend/ .
+RUN npm run build
+
 # ---- Build stage: install deps + compile tree-sitter ----
 FROM python:3.13-slim AS build
 
@@ -17,6 +28,9 @@ FROM python:3.13-slim
 
 WORKDIR /app
 
+# Git and ripgrep needed at runtime for tools
+RUN apt-get update && apt-get install -y --no-install-recommends git ripgrep && rm -rf /var/lib/apt/lists/*
+
 # Copy installed packages from build
 COPY --from=build /usr/local/lib/python3.13/site-packages /usr/local/lib/python3.13/site-packages
 COPY --from=build /usr/local/bin /usr/local/bin
@@ -26,17 +40,17 @@ COPY --from=build /data/kubernetes /data/kubernetes
 
 # Copy application code
 COPY src/ src/
-COPY static/ static/
 COPY main.py .
+
+# Copy React build output as static files
+COPY --from=frontend-build /app/build static/
 
 # Copy pre-built data files
 COPY output/code-graph-full.json output/code-graph-full.json
-COPY output/file-index3.db       output/file-index3.db
 COPY output/doc-index.db         output/doc-index.db
 
 ENV PYTHONUNBUFFERED=1
 ENV GRAPH_PATH=output/code-graph-full.json
-ENV INDEX_DB=output/file-index3.db
 ENV DOCS_INDEX_DB=output/doc-index.db
 ENV REPO_ROOT=/data/kubernetes
 ENV DOCS_ROOT=/data/docs
